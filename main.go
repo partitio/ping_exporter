@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/czerwonk/ping_exporter/config"
 	"github.com/digineo/go-ping"
 	mon "github.com/digineo/go-ping/monitor"
+
+	"github.com/czerwonk/ping_exporter/config"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -22,18 +24,19 @@ import (
 const version string = "0.4.7"
 
 var (
-	showVersion   = kingpin.Flag("version", "Print version information").Default().Bool()
-	listenAddress = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface").Default(":9427").String()
-	metricsPath   = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics").Default("/metrics").String()
-	configFile    = kingpin.Flag("config.path", "Path to config file").Default("").String()
-	pingInterval  = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Default("5s").Duration()
-	pingTimeout   = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Default("4s").Duration()
-	pingSize      = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Default("56").Uint16()
-	historySize   = kingpin.Flag("ping.history-size", "Number of results to remember per target").Default("10").Int()
-	dnsRefresh    = kingpin.Flag("dns.refresh", "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)").Default("1m").Duration()
-	dnsNameServer = kingpin.Flag("dns.nameserver", "DNS server used to resolve hostname of targets").Default("").String()
-	logLevel      = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
-	targets       = kingpin.Arg("targets", "A list of targets to ping").Strings()
+	showVersion    = kingpin.Flag("version", "Print version information").Default().Bool()
+	listenAddress  = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface").Default(":9427").String()
+	metricsPath    = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics").Default("/metrics").String()
+	configFile     = kingpin.Flag("config.path", "Path to config file").Default("").String()
+	pingInterval   = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Default("5s").Duration()
+	pingTimeout    = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Default("4s").Duration()
+	pingSize       = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Default("56").Uint16()
+	historySize    = kingpin.Flag("ping.history-size", "Number of results to remember per target").Default("10").Int()
+	dnsRefresh     = kingpin.Flag("dns.refresh", "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)").Default("1m").Duration()
+	dnsNameServer  = kingpin.Flag("dns.nameserver", "DNS server used to resolve hostname of targets").Default("").String()
+	logLevel       = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
+	targets        = kingpin.Arg("targets", "A list of targets to ping").Strings()
+	targetsTimeout = kingpin.Flag("targets.timeout", "Timeout in seconds to remove not queried targets").Default("10").Int()
 )
 
 var (
@@ -42,6 +45,11 @@ var (
 
 	rttMetricsScale = rttInMills // might change in future
 	rttMode         = kingpin.Flag("metrics.rttunit", "Export ping results as either millis (default), or seconds (best practice), or both (for migrations). Valid choices: [ms, s, both]").Default("ms").String()
+
+	cfg      *config.Config
+	resolver *net.Resolver
+
+	targetsMap sync.Map
 )
 
 func init() {
@@ -54,8 +62,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	err := log.Logger.SetLevel(log.Base(), *logLevel)
-	if err != nil {
+	if err := log.Logger.SetLevel(log.Base(), *logLevel); err != nil {
 		log.Errorln(err)
 		os.Exit(1)
 	}
@@ -83,7 +90,8 @@ func main() {
 		metricsPath = &mpath
 	}
 
-	cfg, err := loadConfig()
+	var err error
+	cfg, err = loadConfig()
 	if err != nil {
 		kingpin.FatalUsage("could not load config.path: %v", err)
 	}
@@ -94,10 +102,6 @@ func main() {
 
 	if cfg.Ping.Size > 65500 {
 		kingpin.FatalUsage("ping.size must be between 0 and 65500")
-	}
-
-	if len(cfg.Targets) == 0 {
-		kingpin.FatalUsage("No targets specified")
 	}
 
 	m, err := startMonitor(cfg)
@@ -117,7 +121,7 @@ func printVersion() {
 }
 
 func startMonitor(cfg *config.Config) (*mon.Monitor, error) {
-	resolver := setupResolver(cfg)
+	resolver = setupResolver(cfg)
 	var bind4, bind6 string
 	if ln, err := net.Listen("tcp4", "127.0.0.1:0"); err == nil {
 		// ipv4 enabled
@@ -191,14 +195,57 @@ func startServer(monitor *mon.Monitor) {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, indexHTML, *metricsPath)
 	})
-
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(&pingCollector{monitor: monitor})
+	reg.MustRegister(&pingBatchCollector{monitor: monitor})
 	h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		ErrorLog:      log.NewErrorLogger(),
 		ErrorHandling: promhttp.ContinueOnError,
 	})
-	http.Handle(*metricsPath, h)
+	http.HandleFunc(*metricsPath, func(w http.ResponseWriter, r *http.Request) {
+		tg := r.URL.Query().Get("target")
+		if tg == "" {
+			h.ServeHTTP(w, r)
+			return
+		}
+		t := &target{
+			host:      tg,
+			delay:     time.Millisecond,
+			resolver:  resolver,
+		}
+		addrs, err := t.resolver.LookupIPAddr(context.Background(), t.host)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(addrs) == 0 {
+			http.Error(w, "cannot resolve target", http.StatusBadRequest)
+			return
+		}
+		to, ok := targetsMap.Load(tg)
+		if !ok {
+			log.Infof("Adding target: %s", tg)
+			if err := t.addIfNew(addrs[0], monitor); err != nil {
+				log.Errorf("failed to add target %s: %v", tg, err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			to.(*time.Timer).Stop()
+		}
+		registry := prometheus.NewRegistry()
+		c := &pingCollector{target: t.nameForIP(addrs[0]), monitor: monitor}
+		registry.MustRegister(c)
+		h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+			ErrorLog:      log.NewErrorLogger(),
+			ErrorHandling: promhttp.ContinueOnError,
+		})
+		targetsMap.Store(tg, time.AfterFunc(time.Duration(*targetsTimeout)*time.Second, func() {
+			log.Infof("Removing timed out target: %s", tg)
+			targetsMap.Delete(tg)
+			t.cleanUp(t.addresses, monitor)
+		}))
+		h.ServeHTTP(w, r)
+	})
 
 	log.Infof("Listening for %s on %s", *metricsPath, *listenAddress)
 	log.Fatal(http.ListenAndServe(*listenAddress, nil))
@@ -208,7 +255,6 @@ func loadConfig() (*config.Config, error) {
 	if *configFile == "" {
 		cfg := config.Config{}
 		addFlagToConfig(&cfg)
-
 		return &cfg, nil
 	}
 

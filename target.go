@@ -20,13 +20,12 @@ type target struct {
 }
 
 func (t *target) addOrUpdateMonitor(monitor *mon.Monitor) error {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-
 	addrs, err := t.resolver.LookupIPAddr(context.Background(), t.host)
 	if err != nil {
 		return fmt.Errorf("error resolving target: %w", err)
 	}
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
 
 	for _, addr := range addrs {
 		err := t.addIfNew(addr, monitor)
@@ -64,6 +63,17 @@ func (t *target) add(addr net.IPAddr, monitor *mon.Monitor) error {
 	log.Infof("adding target for host %s (%v)", t.host, addr)
 
 	return monitor.AddTargetDelayed(name, addr, t.delay)
+}
+
+func (t *target) resolve() error {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	addrs, err := t.resolver.LookupIPAddr(context.Background(), t.host)
+	if err != nil {
+		return fmt.Errorf("error resolving target: %w", err)
+	}
+	t.addresses = addrs
+	return nil
 }
 
 func (t *target) nameForIP(addr net.IPAddr) string {

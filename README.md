@@ -47,6 +47,28 @@ $ # use Cloudflare's public DNS server
 $ ./ping_exporter --dns.nameserver=1.1.1.1:53 [other options]
 ```
 
+### Prometheus Configuration
+
+`target` can be passed as a parameter through relabelling.
+
+Example config:
+```YAML
+scrape_configs:
+  - job_name: 'ping'
+    static_configs:
+      - targets:
+        - 192.168.1.2
+        - google.com
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9427  # The ping exporter's real hostname:port.
+```
+
 ### Exported metrics
 
 - `ping_rtt_best_ms`:          Best round trip time in millis
